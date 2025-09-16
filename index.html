@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>이미지 용량 추출기</title>
+  <!-- Tailwind (CDN) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React / ReactDOM (CDN) -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <!-- Babel (브라우저에서 JSX 변환) -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+</head>
+<body class="bg-gray-50">
+  <div id="root"></div>
+
+  <script type="text/babel">
+    const { useState, useMemo, useRef } = React;
+
+    // ===== 유틸 =====
+    function formatBytes(bytes) {
+      if (bytes == null || Number.isNaN(bytes)) return "-";
+      const thresh = 1024;
+      if (Math.abs(bytes) < thresh) return `${bytes} B`;
+      const units = ["KB", "MB", "GB", "TB"];
+      let u = -1; let b = bytes;
+      do { b /= thresh; ++u; } while (Math.abs(b) >= thresh && u < units.length - 1);
+      return `${b.toFixed(2)} ${units[u]}`;
+    }
+
+    function dataUrlSizeBytes(dataUrl) {
+      const comma = dataUrl.indexOf(",");
+      if (comma === -1) return null;
+      const meta = dataUrl.substring(5, comma);
+      const payload = dataUrl.substring(comma + 1);
+      const isBase64 = /;base64/i.test(meta);
+      if (isBase64) {
+        const len = payload.length;
+        const padding = (payload.endsWith("==") ? 2 : payload.endsWith("=") ? 1 : 0);
+        return Math.floor(len * 3 / 4) - padding;
+      }
+      try {
+        const decoded = decodeURIComponent(payload.replace(/\+/g, "%20"));
+        return new TextEncoder().encode(decoded).length;
+      } catch (e) {
+        return null;
+      }
+    }
+
+    function toAbsoluteUrl(url, base) {
+      try { return new URL(url, base || window.location.href).href; }
+      catch { return url; }
+    }
+
+    function parseSrcset(srcset) {
+      return srcset
+        .split(",")
+        .map(x => x.trim())
+        .filter(Boolean)
+        .map(item => item.split(/\s+/)[0])
+        .filter(Boolean);
+    }
+
+    async function probeImage(url, { proxyBase, preferMethod = "HEAD" } = {}) {
+      const make = (ok) => ({
+        url,
+        ok: !!ok,
+        status: ok?.status ?? null,
+        type: ok?.type ?? null,
+        methodTried: ok?.methodTried ?? null,
+        viaProxy: !!ok?.viaProxy,
+        sizeBytes: ok?.sizeBytes ?? null,
+        note: ok?.note ?? null,
+        cors: ok?.cors ?? null,
+        timeMs: ok?.timeMs ?? null,
+      });
+
+      if (url.startsWith("data:")) {
+        const size = dataUrlSizeBytes(url);
+        return make({
+          status: 200,
+          type: url.substring(5, url.indexOf(",")) || "data",
+          methodTried: "inline",
+          viaProxy: false,
+          sizeBytes: size,
+          note: "inline data URI",
+          cors: "n/a",
+          timeMs: 0,
+        });
+      }
+
+      async function tryFetch(u, method, useProxy) {
+        const t0 = performance.now();
+        try {
+          const target = useProxy && proxyBase ? `${proxyBase}${encodeURIComponent(u)}` : u;
+          const resp = await fetch(target, {
+            method,
+            mode: "cors",
+            cache: "no-store",
+            redirect: "follow",
+          });
+          const ct = resp.headers.get("content-type");
+          let size = null;
+          const cl = resp.headers.get("content-length");
+          if (cl && !Number.isNaN(+cl)) size = +cl;
+          if (size == null && method === "GET" && resp.ok) {
+            try {
+              const buf = await resp.arrayBuffer();
+              size = buf.byteLength;
+            } catch {}
+          }
+          const t1 = performance.now();
+          return {
+            status: resp.status,
+            type: ct,
+            methodTried: method,
+            viaProxy: !!useProxy,
+            sizeBytes: size,
+            note: size == null ? "content-length 미제공 또는 본문 접근 제한" : null,
+            cors: "ok",
+            timeMs: Math.round(t1 - t0),
+          };
+        } catch (e) {
+          const t1 = performance.now();
+          const isCors = e instanceof TypeError;
+          return {
+            status: null,
+            type: null,
+            methodTried: method,
+            viaProxy: !!useProxy,
+            sizeBytes: null,
+            note: isCors ? "CORS/네트워크 차단" : String(e),
+            cors: isCors ? "blocked" : "unknown",
+            timeMs: Math.round(t1 - t0),
+          };
+        }
+      }
+
+      const order = [
+        { method: preferMethod },
+        { method: preferMethod === "HEAD" ? "GET" : "HEAD" },
+        { method: preferMethod, proxy: true },
+        { method: preferMethod === "HEAD" ? "GET" : "HEAD", proxy: true },
+      ];
+
+      for (const step of order) {
+        const r = await tryFetch(url, step.method, step.proxy);
+        if (r && ((r.status && r.status < 400) || r.sizeBytes != null)) {
+          return make(r);
+        }
+      }
+      return make({ status: null, type: null, methodTried: null, viaProxy: false, sizeBytes: null, note: "모든 시도 실패" });
+    }
+
+    function useConcurrency(limit = 8) {
+      const queue = useRef([]);
+      const active = useRef(0);
+      async function run(task) {
+        return new Promise((resolve, reject) => {
+          const exec = async () => {
+            active.current++;
+            try { resolve(await task()); }
+            catch (e) { reject(e); }
+            finally {
+              active.current--;
+              if (queue.current.length) queue.current.shift()();
+            }
+          };
+          if (active.current < limit) exec(); else queue.current.push(exec);
+        });
+      }
+      return run;
+    }
+
+    function App() {
+      const [html, setHtml] = useState("");
+      const [baseUrl, setBaseUrl] = useState("");
+      const [proxyBase, setProxyBase] = useState(""); // 예: https://your-worker.workers.dev/?url=
+      const [includeSrcset, setIncludeSrcset] = useState(true);
+      const [results, setResults] = useState([]);
+      const [analyzing, setAnalyzing] = useState(false);
+      const [progress, setProgress] = useState({ done: 0, total: 0 });
+      const [threshold, setThreshold] = useState(300 * 1024);
+
+      const runLimited = useConcurrency(8);
+
+      const handleAnalyze = async () => {
+        setAnalyzing(true);
+        setResults([]);
+        try {
+          const parser = new DOMParser();
+          const doc = parser.parseFromString(html || "", "text/html");
+          const imgs = Array.from(doc.querySelectorAll("img"));
+
+          const candidateUrls = [];
+          for (const img of imgs) {
+            const s = img.getAttribute("src");
+            if (s) candidateUrls.push({ url: s, via: "src" });
+            if (includeSrcset) {
+              const ss = img.getAttribute("srcset");
+              if (ss) parseSrcset(ss).forEach(u => candidateUrls.push({ url: u, via: "srcset" }));
+            }
+          }
+
+          const map = new Map();
+          for (const c of candidateUrls) {
+            const abs = toAbsoluteUrl(c.url, baseUrl || window.location.href);
+            if (!map.has(abs)) map.set(abs, c.via);
+          }
+          const urls = Array.from(map.keys());
+          setProgress({ done: 0, total: urls.length });
+
+          const temp = [];
+          let done = 0;
+          await Promise.all(
+            urls.map(u => runLimited(async () => {
+              const r = await probeImage(u, { proxyBase });
+              temp.push(r);
+              done++;
+              setProgress({ done, total: urls.length });
+            }))
+          );
+
+          temp.sort((a, b) => (b.sizeBytes || 0) - (a.sizeBytes || 0));
+          setResults(temp);
+        } finally {
+          setAnalyzing(false);
+        }
+      };
+
+      const totalBytes = useMemo(
+        () => results.reduce((acc, r) => acc + (r.sizeBytes || 0), 0), [results]
+      );
+
+      function exportCSV() {
+        const headers = ["#", "URL", "Size(bytes)", "Size(human)", "Type", "Status", "Method", "ViaProxy", "CORS", "Note"];
+        const rows = results.map((r, i) => [
+          i + 1,
+          r.url,
+          r.sizeBytes ?? "",
+          formatBytes(r.sizeBytes),
+          r.type ?? "",
+          r.status ?? "",
+          r.methodTried ?? "",
+          r.viaProxy ? "yes" : "no",
+          r.cors ?? "",
+          r.note ?? "",
+        ]);
+        const csv = [headers, ...rows]
+          .map(row => row.map(x => `"${String(x).replaceAll('"','""')}"`).join(","))
+          .join("\n");
+        const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = "image_sizes.csv"; a.click();
+        URL.revokeObjectURL(url);
+      }
+
+      const sampleHtml = `
+<section>
+  <h2>샘플</h2>
+  <img src="https://upload.wikimedia.org/wikipedia/commons/thumb/a/a9/Example.jpg/320px-Example.jpg" alt="ex"/>
+  <img src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB..." alt="inline"/>
+  <img srcset="/images/hero-800.jpg 800w, /images/hero-1200.jpg 1200w" src="/images/hero-800.jpg" alt="relative"/>
+</section>`.trim();
+
+      return (
+        <div className="min-h-screen text-gray-900 p-6">
+          <div className="max-w-6xl mx-auto space-y-6">
+            <header className="flex items-center justify-between">
+              <h1 className="text-2xl font-bold">이미지 용량 추출기</h1>
+              <div className="text-sm text-gray-500">HTML 붙여넣기 → &lt;img&gt; URL 추출 → HEAD/GET 검사 → 용량</div>
+            </header>
+
+            <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
+              <div className="lg:col-span-2 space-y-2">
+                <label className="text-sm font-medium">HTML 입력</label>
+                <textarea
+                  className="w-full h-56 rounded-xl border border-gray-300 p-3 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                  placeholder="여기에 HTML을 붙여넣으세요"
+                  value={html}
+                  onChange={(e) => setHtml(e.target.value)}
+                />
+                <div className="flex gap-2 text-sm">
+                  <button className="px-3 py-2 rounded-lg bg-gray-200 hover:bg-gray-300" onClick={() => setHtml(sampleHtml)}>샘플 채우기</button>
+                  <button className="px-3 py-2 rounded-lg bg-gray-200 hover:bg-gray-300" onClick={() => setHtml("")}>초기화</button>
+                </div>
+              </div>
+              <div className="space-y-3">
+                <div>
+                  <label className="text-sm font-medium">기준(Base) URL (상대경로 해결용)</label>
+                  <input
+                    className="mt-1 w-full rounded-lg border border-gray-300 p-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    placeholder="예: https://example.com/page/path/"
+                    value={baseUrl}
+                    onChange={(e) => setBaseUrl(e.target.value)}
+                  />
+                </div>
+                <div>
+                  <label className="text-sm font-medium">프록시 베이스(선택)</label>
+                  <input
+                    className="mt-1 w-full rounded-lg border border-gray-300 p-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    placeholder="예: https://your-worker.workers.dev/?url="
+                    value={proxyBase}
+                    onChange={(e) => setProxyBase(e.target.value)}
+                  />
+                  <p className="text-xs text-gray-500 mt-1">외부 도메인 CORS 차단 시 사용. 서버에서 대상 URL을 받아 HEAD/GET 후 헤더를 그대로 전달해야 합니다.</p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input id="srcset" type="checkbox" checked={includeSrcset} onChange={(e) => setIncludeSrcset(e.target.checked)} />
+                  <label htmlFor="srcset" className="text-sm">srcset 후보들도 포함</label>
+                </div>
+                <div>
+                  <label className="text-sm font-medium">경고 임계값</label>
+                  <div className="flex items-center gap-2 mt-1">
+                    <input
+                      type="number"
+                      className="w-36 rounded-lg border border-gray-300 p-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                      value={threshold}
+                      onChange={(e) => setThreshold(Number(e.target.value) || 0)}
+                    />
+                    <span className="text-sm text-gray-500">bytes (예: 307200 = 300KB)</span>
+                  </div>
+                </div>
+                <button
+                  onClick={handleAnalyze}
+                  disabled={analyzing}
+                  className={`w-full py-2 rounded-lg text-white ${analyzing ? "bg-gray-400" : "bg-indigo-600 hover:bg-indigo-700"}`}
+                >{analyzing ? "분석 중..." : "분석하기"}</button>
+                {progress.total > 0 && (
+                  <div>
+                    <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
+                      <div className="h-full bg-indigo-600" style={{ width: `${Math.round((progress.done / progress.total) * 100)}%` }} />
+                    </div>
+                    <div className="mt-1 text-xs text-gray-600">{progress.done} / {progress.total}</div>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <section className="bg-white rounded-xl shadow-sm border border-gray-200 p-4">
+              <div className="flex items-center justify-between">
+                <h2 className="font-semibold">결과 ({results.length}개)</h2>
+                <div className="flex items-center gap-2 text-sm">
+                  <span className="text-gray-600">총 용량: <b>{formatBytes(totalBytes)}</b></span>
+                  <button onClick={exportCSV} className="px-3 py-1 rounded-lg bg-gray-100 hover:bg-gray-200">CSV 다운로드</button>
+                </div>
+              </div>
+              <div className="overflow-x-auto mt-3">
+                <table className="min-w-full text-sm">
+                  <thead>
+                    <tr className="text-left bg-gray-50">
+                      <th className="p-2">#</th>
+                      <th className="p-2">URL</th>
+                      <th className="p-2">Size</th>
+                      <th className="p-2">Type</th>
+                      <th className="p-2">Status</th>
+                      <th className="p-2">Method</th>
+                      <th className="p-2">Proxy</th>
+                      <th className="p-2">CORS</th>
+                      <th className="p-2">Note</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {results.map((r, i) => (
+                      <tr key={r.url} className="border-t border-gray-100">
+                        <td className="p-2 text-gray-500">{i + 1}</td>
+                        <td className="p-2 max-w-xl truncate">
+                          <a href={r.url} target="_blank" rel="noreferrer" className="text-indigo-600 hover:underline">{r.url}</a>
+                        </td>
+                        <td className={`p-2 ${r.sizeBytes && r.sizeBytes >= threshold ? "text-red-600 font-semibold" : ""}`}>
+                          {r.sizeBytes != null ? <>{formatBytes(r.sizeBytes)} <span className="text-gray-400">({r.sizeBytes.toLocaleString()} B)</span></> : <span className="text-gray-400">-</span>}
+                        </td>
+                        <td className="p-2">{r.type || <span className="text-gray-400">-</span>}</td>
+                        <td className="p-2">{r.status ?? <span className="text-gray-400">-</span>}</td>
+                        <td className="p-2">{r.methodTried || <span className="text-gray-400">-</span>}</td>
+                        <td className="p-2">{r.viaProxy ? "yes" : "no"}</td>
+                        <td className="p-2">{r.cors || <span className="text-gray-400">-</span>}</td>
+                        <td className="p-2">{r.note || <span className="text-gray-400">""</span>}</td>
+                      </tr>
+                    ))}
+                    {results.length === 0 && (
+                      <tr>
+                        <td colSpan="9" className="p-6 text-center text-gray-400">분석 결과가 없습니다.</td>
+                      </tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+
+            <details className="bg-white rounded-xl shadow-sm border border-gray-200 p-4">
+              <summary className="cursor-pointer font-semibold">CORS로 막힐 때(외부 도메인) 간단 프록시 예시: Cloudflare Worker</summary>
+              <pre className="mt-3 text-xs overflow-auto bg-gray-50 p-3 rounded-lg"><code>{`export default {
+  async fetch(request) {
+    const { searchParams } = new URL(request.url);
+    const url = searchParams.get('url');
+    if (!url) return new Response('Missing url', { status: 400 });
+    const upstream = await fetch(url, { method: request.method === 'GET' ? 'GET' : 'HEAD' });
+    const headers = new Headers(upstream.headers);
+    headers.set('Access-Control-Allow-Origin', '*');
+    headers.set('Vary', 'Origin');
+    return new Response(request.method === 'GET' ? upstream.body : null, {
+      status: upstream.status,
+      headers
+    });
+  }
+};
+// 배포 후 프록시 베이스: https://your-worker.workers.dev/?url=`}</code></pre>
+              <p className="text-xs text-gray-500 mt-2">운영시 도메인 화이트리스트/인증/요청 제한 등 보안 조치 필수.</p>
+            </details>
+
+            <details className="bg-white rounded-xl shadow-sm border border-gray-200 p-4">
+              <summary className="cursor-pointer font-semibold">주의사항</summary>
+              <ul className="list-disc pl-5 text-sm mt-2 space-y-1 text-gray-700">
+                <li>외부 도메인이 CORS를 막으면 브라우저만으로 용량 확인이 불가할 수 있습니다(프록시 사용).</li>
+                <li>일부 서버는 <code>Content-Length</code>를 주지 않습니다. 이때는 GET 본문 길이로 추정합니다.</li>
+                <li>상대경로 이미지는 Base URL을 채워야 정확히 해석됩니다.</li>
+                <li><code>srcset</code> 후보가 많으면 검사 URL 수가 많아질 수 있습니다(내부 중복 제거는 URL 단위).</li>
+              </ul>
+            </details>
+
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>
